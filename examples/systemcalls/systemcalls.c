@@ -16,6 +16,15 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
+    int ret = system(cmd);
+    if (ret == -1) {
+        perror("system call failed");
+        return false;
+    } else if (ret!= 0) {
+        // Command returned a non-zero exit status
+        fprintf(stderr, "Command exited with status %d\n", ret);
+        return false;
+    }
 
     return true;
 }
@@ -58,7 +67,43 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    pid_t pid = fork();
 
+    if (pid == 0) {
+        // Child process
+        if (execv(command[0], command) == -1) {
+            // If execv fails
+            perror("execv failed");
+            va_end(args);
+            exit(1); // Use exit to terminate child process
+        }
+    } else if (pid < 0) {
+        // Fork failed
+        perror("fork failed");
+        va_end(args);
+        return false;
+    } else {
+        // Parent process
+        int status;
+        pid_t pid1 = wait(&status);
+        if (pid1 == -1) {
+            perror("waitpid failed");
+            va_end(args);
+            return false;
+        }
+        if (WIFEXITED(status)) {
+            int exit_status = WEXITSTATUS(status);
+            if (exit_status != 0) {
+                // Command failed
+                va_end(args);
+                return false;
+            }
+        } else {
+            // Command did not terminate normally
+            va_end(args);
+            return false;
+        }
+    }
     va_end(args);
 
     return true;
@@ -92,7 +137,58 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+    int fd = open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+    if (fd < 0) {
+        perror("open failed");
+        va_end(args);
+        return false;
+    }
 
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        // Child process
+        if (dup2(fd, STDOUT_FILENO) < 0) {
+            perror("dup2 failed");
+            close(fd);
+            exit(1); // Use exit to terminate child process
+        }
+
+        close(fd);
+
+        if (execv(command[0], command) == -1) {
+            // If execv fails
+            perror("execv failed");
+            exit(1); // Use exit to terminate child process
+        }
+    } else if (pid < 0) {
+        // Fork failed
+        perror("fork failed");
+        va_end(args);
+        return false;
+    } else {
+        // Parent process
+        close(fd);
+        int status;
+        pid_t pid1 = wait(&status);
+        if (pid1 == -1) {
+            perror("waitpid failed");
+            va_end(args);
+            return false;
+        }
+        if (WIFEXITED(status)) {
+            int exit_status = WEXITSTATUS(status);
+            if (exit_status != 0) {
+                // Command failed
+                va_end(args);
+                return false;
+            }
+        } else {
+            // Command did not terminate normally
+            va_end(args);
+            return false;
+        }
+    }
     va_end(args);
 
     return true;
