@@ -14,6 +14,7 @@
 #include <netdb.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <pthread.h>
 
 #define PORT 9000
 #define PORT_STR "9000"
@@ -37,6 +38,8 @@ static int ipaddr_to_str(struct sockaddr_in *addr, char *buf, size_t buflen) {
     }
     return 0;
 }
+
+
 
 static int append_packet_to_file(const char *filename, const char *data, size_t len) {
     int fd = open(filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -87,6 +90,106 @@ static int send_file_to_client(int client_sockfd, const char *filename) {
 
     close(fd);
     return 0;
+}
+
+// Thread data structure for joining later
+struct thread_data {
+    pthread_t thread_id;
+    int client_fd;
+    char client_ip[INET_ADDRSTRLEN];
+    bool thread_complete;
+    struct thread_data *next;
+};
+
+// Mutex for synchronizing access to temp file
+static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void *handle_client(void *arg) {
+    struct thread_data *data = (struct thread_data *)arg;
+    int client_sockfd = data->client_fd;
+
+    // Handle client communication
+    // Receive data from client until newline character is found
+    char buffer[BUFFER_SIZE];
+    char *packet = NULL;
+    ssize_t packet_len = 0;
+    int client_done = 0;
+    
+    while (!client_done && !exit_flag) {
+        ssize_t bytes_received = recv(client_sockfd, buffer, sizeof(buffer) - 1, 0);
+        if (bytes_received < 0) {
+            syslog(LOG_ERR, "Receive failed: %s", strerror(errno));
+            break;
+        } else if (bytes_received == 0) {
+            // Connection closed by client
+            client_done = 1;
+            break;
+        } else {
+            char *tmp = realloc(packet, packet_len + bytes_received);
+            if (tmp == NULL) {
+                syslog(LOG_ERR, "Memory allocation failed");
+                free(packet);
+                packet = NULL;
+                packet_len = 0;
+                continue;
+            }
+
+            packet = tmp;
+            memcpy(packet + packet_len, buffer, bytes_received);
+            packet_len += bytes_received;
+            
+            ssize_t processed_up_to = 0;
+            for (ssize_t i = 0; i < packet_len; i++) {
+                if (packet[i] == '\n') {
+                    ssize_t line_len = i - processed_up_to + 1;
+                    pthread_mutex_lock(&file_mutex);
+                    if (append_packet_to_file(FILE_NAME, packet + processed_up_to, line_len) != 0) {
+                        syslog(LOG_ERR, "Failed to append data to file");
+                    }
+                    send_file_to_client(client_sockfd, FILE_NAME);
+                    pthread_mutex_unlock(&file_mutex);
+                    processed_up_to = i + 1;
+                }
+            }
+
+            if (processed_up_to == packet_len) {
+                free(packet);
+                packet = NULL;
+                packet_len = 0;
+            } else if (processed_up_to > 0) {
+                ssize_t remaining = packet_len - processed_up_to;
+                memmove(packet, packet + processed_up_to, remaining);
+                char *tmp2 = realloc(packet, remaining);
+                if (tmp2 != NULL) {
+                    packet = tmp2;
+                }
+                packet_len = remaining;
+            }
+        }
+    }
+
+    free(packet);
+    syslog(LOG_INFO, "Closed connection from %s", data->client_ip);
+    close(client_sockfd);
+    return NULL;
+}
+
+void *timestamp_thread(void *arg) {
+    while (!exit_flag) {
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+
+        char timestamp[128];
+        strftime(timestamp, sizeof(timestamp),
+                 "timestamp:%a, %d %b %Y %H:%M:%S %z\n",
+                 tm_info);
+
+        pthread_mutex_lock(&file_mutex);
+        append_packet_to_file(FILE_NAME, timestamp, strlen(timestamp));
+        pthread_mutex_unlock(&file_mutex);
+        sleep(10);
+    }
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
@@ -196,10 +299,19 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    struct thread_data *head = NULL;
+
+    pthread_t timer_thread_id;
+    if (pthread_create(&timer_thread_id, NULL, timestamp_thread, NULL) != 0) {
+        syslog(LOG_ERR, "Failed to create timer thread: %s", strerror(errno));
+    }
+
     while(!exit_flag) {
         struct sockaddr_in client_addr;
         socklen_t client_addr_len = sizeof(client_addr);
         int client_sockfd = accept(sockfd, (struct sockaddr *)&client_addr, &client_addr_len);
+
+        // Create a new thread for every client connection
         if (client_sockfd < 0) {
             if (errno == EINTR && exit_flag) {
                 // Interrupted by signal, exit gracefully
@@ -209,75 +321,41 @@ int main(int argc, char *argv[]) {
             continue; // Continue to next iteration to accept new connections
         }
 
-        char client_ip[INET_ADDRSTRLEN];
-        if (ipaddr_to_str(&client_addr, client_ip, sizeof(client_ip)) == 0) {
-            syslog(LOG_INFO, "Accepted connection from %s", client_ip);
+        struct thread_data *node = malloc(sizeof(*node));
+        node->client_fd = client_sockfd;
+        node->thread_complete = false;
+        node->next = head;
+        head = node;
+
+        if (ipaddr_to_str(&client_addr, node->client_ip, sizeof(node->client_ip)) == 0) {
+            syslog(LOG_INFO, "Accepted connection from %s", node->client_ip);
         } else {
             syslog(LOG_ERR, "Failed to convert client IP address to string");
         }
 
-        // Receive data from client until newline character is found
-        char buffer[BUFFER_SIZE];
-        char *packet = NULL;
-        ssize_t packet_len = 0;
-        int client_done = 0;
-        
-        while (!client_done && !exit_flag) {
-            ssize_t bytes_received = recv(client_sockfd, buffer, sizeof(buffer) - 1, 0);
-            if (bytes_received < 0) {
-                syslog(LOG_ERR, "Receive failed: %s", strerror(errno));
-                break;
-            } else if (bytes_received == 0) {
-                // Connection closed by client
-                client_done = 1;
-                break;
+        if (pthread_create(&node->thread_id, NULL, handle_client, (void *)node) != 0) {
+            syslog(LOG_ERR, "Failed to create thread: %s", strerror(errno));
+            close(client_sockfd);
+            node->thread_complete = true;
+        }
+
+        // Clean up completed threads
+        struct thread_data **curr = &head;
+        while (*curr) {
+            if ((*curr)->thread_complete) {
+                pthread_join((*curr)->thread_id, NULL);
+                struct thread_data *tmp = *curr;
+                *curr = (*curr)->next;
+                free(tmp);
             } else {
-                char *tmp = realloc(packet, packet_len + bytes_received);
-                if (tmp == NULL) {
-                    syslog(LOG_ERR, "Memory allocation failed");
-                    free(packet);
-                    packet = NULL;
-                    packet_len = 0;
-                    continue;
-                }
-
-                packet = tmp;
-                memcpy(packet + packet_len, buffer, bytes_received);
-                packet_len += bytes_received;
-                
-                ssize_t processed_up_to = 0;
-                for (ssize_t i = 0; i < packet_len; i++) {
-                    if (packet[i] == '\n') {
-                        ssize_t line_len = i - processed_up_to + 1;
-                        if (append_packet_to_file(FILE_NAME, packet + processed_up_to, line_len) != 0) {
-                            syslog(LOG_ERR, "Failed to append data to file");
-                        }
-                        send_file_to_client(client_sockfd, FILE_NAME);
-                        processed_up_to = i + 1;
-                    }
-                }
-
-                if (processed_up_to == packet_len) {
-                    free(packet);
-                    packet = NULL;
-                    packet_len = 0;
-                } else if (processed_up_to > 0) {
-                    ssize_t remaining = packet_len - processed_up_to;
-                    memmove(packet, packet + processed_up_to, remaining);
-                    char *tmp2 = realloc(packet, remaining);
-                    if (tmp2 != NULL) {
-                        packet = tmp2;
-                    }
-                    packet_len = remaining;
-                }
+                curr = &(*curr)->next;
             }
         }
 
-    free(packet);
-    syslog(LOG_INFO, "Closed connection from %s", client_ip);
-    close(client_sockfd);
-    if (exit_flag) break;
+        if (exit_flag) break;
     }
+
+    pthread_join(timer_thread_id, NULL);
 
     close(sockfd);
     unlink(FILE_NAME);
