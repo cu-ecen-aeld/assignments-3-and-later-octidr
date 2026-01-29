@@ -1,10 +1,12 @@
 # Makefile for the server socket application
 
 # Default compiler setup
-CC := ${CROSS_COMPILE}gcc
+CC ?= ${CROSS_COMPILE}gcc
+CFLAGS ?= -g -Wall -Werror
+LDFLAGS ?= -lpthread -lrt
 
 # Target binary
-TARGET := aesdsocket
+TARGET ?= aesdsocket
 
 # Source files
 SRCS := aesdsocket.c
@@ -15,7 +17,7 @@ all: $(TARGET)
 
 # Build rule
 $(TARGET): $(OBJS)
-	$(CC) $(OBJS) -o $@
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # First compile the source files into object files
 %.o: %.c
