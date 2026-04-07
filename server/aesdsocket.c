@@ -18,10 +18,19 @@
 
 #define PORT 9000
 #define PORT_STR "9000"
-#define FILE_NAME "/var/tmp/aesdsocketdata"
 #define BUFFER_SIZE 1024
 #define BACKLOG 5
 #define FILE_CHUNK_SIZE 4096
+
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+#define FILE_NAME "/dev/aesdchar"
+#else
+#define FILE_NAME "/var/tmp/aesdsocketdata"
+#endif
 
 static volatile sig_atomic_t exit_flag = 0;
 
@@ -42,7 +51,12 @@ static int ipaddr_to_str(struct sockaddr_in *addr, char *buf, size_t buflen) {
 
 
 static int append_packet_to_file(const char *filename, const char *data, size_t len) {
-    int fd = open(filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    int fd;
+    #if USE_AESD_CHAR_DEVICE
+    fd = open(filename, O_RDWR);
+    #else
+    fd = open(filename, O_RDWR | O_CREAT | O_APPEND, 0644);
+    #endif
     if (fd < 0) {
         syslog(LOG_ERR, "Failed to open file: %s", filename);
         return -1;
@@ -301,10 +315,12 @@ int main(int argc, char *argv[]) {
 
     struct thread_data *head = NULL;
 
+    #if !USE_AESD_CHAR_DEVICE
     pthread_t timer_thread_id;
     if (pthread_create(&timer_thread_id, NULL, timestamp_thread, NULL) != 0) {
         syslog(LOG_ERR, "Failed to create timer thread: %s", strerror(errno));
     }
+    #endif
 
     while(!exit_flag) {
         struct sockaddr_in client_addr;
@@ -355,10 +371,14 @@ int main(int argc, char *argv[]) {
         if (exit_flag) break;
     }
 
+    #if !USE_AESD_CHAR_DEVICE
     pthread_join(timer_thread_id, NULL);
+    #endif
 
     close(sockfd);
+    #if !USE_AESD_CHAR_DEVICE
     unlink(FILE_NAME);
+    #endif
     syslog(LOG_INFO, "Server exiting");
     closelog();    
     return 0;

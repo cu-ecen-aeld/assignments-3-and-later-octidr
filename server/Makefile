@@ -5,6 +5,9 @@ CC ?= ${CROSS_COMPILE}gcc
 CFLAGS ?= -g -Wall -Werror
 LDFLAGS ?= -lpthread -lrt
 
+# AESD_CHAR_DEVICE default flag
+CFLAGS += -DUSE_AESD_CHAR_DEVICE=1
+
 # Target binary
 TARGET ?= aesdsocket
 
