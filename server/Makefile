@@ -6,7 +6,7 @@ CFLAGS ?= -g -Wall -Werror
 LDFLAGS ?= -lpthread -lrt
 
 # AESD_CHAR_DEVICE default flag
-CFLAGS += -DUSE_AESD_CHAR_DEVICE=1
+CFLAGS += -DUSE_AESD_CHAR_DEVICE=1 -I../aesd-char-driver
 
 # Target binary
 TARGET ?= aesdsocket
@@ -24,7 +24,7 @@ $(TARGET): $(OBJS)
 
 # First compile the source files into object files
 %.o: %.c
-	$(CC) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@
 
 # Clean rule
 clean:

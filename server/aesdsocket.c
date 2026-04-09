@@ -28,6 +28,7 @@
 
 #if USE_AESD_CHAR_DEVICE
 #define FILE_NAME "/dev/aesdchar"
+#include "aesd_ioctl.h"
 #else
 #define FILE_NAME "/var/tmp/aesdsocketdata"
 #endif
@@ -50,35 +51,28 @@ static int ipaddr_to_str(struct sockaddr_in *addr, char *buf, size_t buflen) {
 
 
 
-static int append_packet_to_file(const char *filename, const char *data, size_t len) {
-    int fd;
-    #if USE_AESD_CHAR_DEVICE
-    fd = open(filename, O_RDWR);
-    #else
-    fd = open(filename, O_RDWR | O_CREAT | O_APPEND, 0644);
-    #endif
+static int append_packet_to_file(int fd, const char *data, size_t len) {
+   
     if (fd < 0) {
-        syslog(LOG_ERR, "Failed to open file: %s", filename);
+        syslog(LOG_ERR, "Failed to open file");
         return -1;
     }
 
     ssize_t bytes_written = write(fd, data, len);
     if (bytes_written < 0 || (size_t)bytes_written != len) {
-        syslog(LOG_ERR, "Failed to write to file: %s, %s", filename, strerror(errno));
+        syslog(LOG_ERR, "Failed to write to file, %s", strerror(errno));
         close(fd);
         return -1;
     }
 
-    syslog(LOG_INFO, "Wrote %d bytes to %s", (int) bytes_written, filename);
+    syslog(LOG_INFO, "Wrote %d bytes", (int) bytes_written);
 
-    close(fd);
     return 0;
 }
 
-static int send_file_to_client(int client_sockfd, const char *filename) {
-    int fd = open(filename, O_RDONLY);
+static int send_file_to_client(int client_sockfd, int fd) {
     if (fd < 0) {
-        syslog(LOG_ERR, "Failed to open file: %s", filename);
+        syslog(LOG_ERR, "Failed to open file");
         return -1;
     }
 
@@ -90,19 +84,16 @@ static int send_file_to_client(int client_sockfd, const char *filename) {
             ssize_t bytes_sent = send(client_sockfd, buffer + total_bytes_sent, bytes_read - total_bytes_sent, 0);
             if (bytes_sent < 0) {
                 syslog(LOG_ERR, "Failed to send file to client");
-                close(fd);
                 return -1;
             }
             total_bytes_sent += bytes_sent;
         }
     }
     if (bytes_read < 0) {
-        syslog(LOG_ERR, "Failed to read from file: %s", filename);
-        close(fd);
+        syslog(LOG_ERR, "Failed to read from file");
         return -1;
     }
 
-    close(fd);
     return 0;
 }
 
@@ -128,6 +119,18 @@ void *handle_client(void *arg) {
     char *packet = NULL;
     ssize_t packet_len = 0;
     int client_done = 0;
+
+    int fd;
+    #if USE_AESD_CHAR_DEVICE
+    fd = open(FILE_NAME, O_RDWR);
+    #else
+    fd = open(FILE_NAME, O_RDWR | O_CREAT | O_APPEND, 0644);
+    #endif
+    if (fd < 0) {
+        syslog(LOG_ERR, "Failed to open file: %s. Closing connection from %s", FILE_NAME, data->client_ip);
+        close(client_sockfd);
+        return NULL;
+    }
     
     while (!client_done && !exit_flag) {
         ssize_t bytes_received = recv(client_sockfd, buffer, sizeof(buffer) - 1, 0);
@@ -139,56 +142,83 @@ void *handle_client(void *arg) {
             client_done = 1;
             break;
         } else {
-            char *tmp = realloc(packet, packet_len + bytes_received);
-            if (tmp == NULL) {
-                syslog(LOG_ERR, "Memory allocation failed");
-                free(packet);
-                packet = NULL;
-                packet_len = 0;
-                continue;
-            }
+        #if USE_AESD_CHAR_DEVICE
+            int write_cmd, write_cmd_offset;
+            if (sscanf(buffer, "AESDCHAR_IOCSEEKTO:%u,%u",&write_cmd, &write_cmd_offset) == 2) {
+                // Send seek command to ioctl
+                struct aesd_seekto seekto;
+                seekto.write_cmd = write_cmd;
+                seekto.write_cmd_offset = write_cmd_offset;
 
-            packet = tmp;
-            memcpy(packet + packet_len, buffer, bytes_received);
-            packet_len += bytes_received;
-            
-            ssize_t processed_up_to = 0;
-            for (ssize_t i = 0; i < packet_len; i++) {
-                if (packet[i] == '\n') {
-                    ssize_t line_len = i - processed_up_to + 1;
-                    pthread_mutex_lock(&file_mutex);
-                    if (append_packet_to_file(FILE_NAME, packet + processed_up_to, line_len) != 0) {
-                        syslog(LOG_ERR, "Failed to append data to file");
+                ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto);
+                send_file_to_client(client_sockfd, fd);
+            }
+            else {
+        #endif
+                // Write data to the device
+
+                char *tmp = realloc(packet, packet_len + bytes_received);
+                if (tmp == NULL) {
+                    syslog(LOG_ERR, "Memory allocation failed");
+                    free(packet);
+                    packet = NULL;
+                    packet_len = 0;
+                    continue;
+                }
+
+                packet = tmp;
+                memcpy(packet + packet_len, buffer, bytes_received);
+                packet_len += bytes_received;
+                
+                ssize_t processed_up_to = 0;
+                for (ssize_t i = 0; i < packet_len; i++) {
+                    if (packet[i] == '\n') {
+                        ssize_t line_len = i - processed_up_to + 1;
+                        pthread_mutex_lock(&file_mutex);
+                        if (append_packet_to_file(fd, packet + processed_up_to, line_len) != 0) {
+                            syslog(LOG_ERR, "Failed to append data to file");
+                        }
+                        send_file_to_client(client_sockfd, fd);
+                        pthread_mutex_unlock(&file_mutex);
+                        processed_up_to = i + 1;
                     }
-                    send_file_to_client(client_sockfd, FILE_NAME);
-                    pthread_mutex_unlock(&file_mutex);
-                    processed_up_to = i + 1;
                 }
-            }
 
-            if (processed_up_to == packet_len) {
-                free(packet);
-                packet = NULL;
-                packet_len = 0;
-            } else if (processed_up_to > 0) {
-                ssize_t remaining = packet_len - processed_up_to;
-                memmove(packet, packet + processed_up_to, remaining);
-                char *tmp2 = realloc(packet, remaining);
-                if (tmp2 != NULL) {
-                    packet = tmp2;
+                if (processed_up_to == packet_len) {
+                    free(packet);
+                    packet = NULL;
+                    packet_len = 0;
+                } else if (processed_up_to > 0) {
+                    ssize_t remaining = packet_len - processed_up_to;
+                    memmove(packet, packet + processed_up_to, remaining);
+                    char *tmp2 = realloc(packet, remaining);
+                    if (tmp2 != NULL) {
+                        packet = tmp2;
+                    }
+                    packet_len = remaining;
                 }
-                packet_len = remaining;
+        #if USE_AESD_CHAR_DEVICE
             }
+        #endif
         }
     }
 
     free(packet);
     syslog(LOG_INFO, "Closed connection from %s", data->client_ip);
+    close(fd);
     close(client_sockfd);
     return NULL;
 }
 
+
+#if !USE_AESD_CHAR_DEVICE
 void *timestamp_thread(void *arg) {
+    int fd = open(FILE_NAME, O_RDWR | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) {
+        syslog(LOG_ERR, "Failed to open file: %s", FILE_NAME);
+        return;
+    }
+
     while (!exit_flag) {
         time_t now = time(NULL);
         struct tm *tm_info = localtime(&now);
@@ -203,8 +233,11 @@ void *timestamp_thread(void *arg) {
         pthread_mutex_unlock(&file_mutex);
         sleep(10);
     }
+
+    close(fd);
     return NULL;
 }
+#endif
 
 int main(int argc, char *argv[]) {
     openlog("aesdsocket", LOG_PID | LOG_CONS, LOG_USER);
